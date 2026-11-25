@@ -180,6 +180,47 @@ func (d *Device) Close() error {
 	return err
 }
 
+// FD devolve o descritor para select() múltiplo.
+func (d *Device) FD() int { return d.fd }
+
+// Select devolve os dispositivos com eventos disponíveis.
+func Select(devices []*Device, timeout time.Duration) ([]*Device, error) {
+	var set syscall.FdSet
+	maxfd := 0
+	for _, d := range devices {
+		fd := d.FD()
+		if fd < 0 || fd >= len(set.Bits)*64 {
+			continue
+		}
+		set.Bits[fd/64] |= 1 << uint(fd%64)
+		if fd > maxfd {
+			maxfd = fd
+		}
+	}
+	if maxfd == 0 {
+		return nil, nil
+	}
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	n, err := syscall.Select(maxfd+1, &set, nil, nil, &tv)
+	if err != nil {
+		if errors.Is(err, syscall.EINTR) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	var ready []*Device
+	for _, d := range devices {
+		fd := d.FD()
+		if fd >= 0 && fd < len(set.Bits)*64 && set.Bits[fd/64]&(1<<uint(fd%64)) != 0 {
+			ready = append(ready, d)
+		}
+	}
+	return ready, nil
+}
+
 func deviceName(fd int) string {
 	buf := make([]byte, 256)
 	req := ioc(2, 'E', 0x06, uintptr(len(buf)))

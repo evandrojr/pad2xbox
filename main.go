@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,7 +30,8 @@ func usage() {
   go run . run [opções]           iniciar o emulador (padrão)
 
 Opções de run/listen:
-  -source string    caminho do gamepad (ex.: /dev/input/event30); vazio = autodetectar
+  -source string    caminho(s) do gamepad, separados por vírgula; vazio = autodetectar
+  -max-pads int     número máximo de pads virtuais (padrão 2)
   -deadzone float   deadzone radial dos sticks (padrão 0.08)
   -name string      nome do controle virtual (padrão "Microsoft X-Box 360 pad")
   -vendor uint      vendor ID virtual (padrão 0x045e)
@@ -39,6 +41,7 @@ Opções de run/listen:
 
 type options struct {
 	source   *string
+	maxPads  *int
 	deadzone *float64
 	name     *string
 	vendor   *uint
@@ -49,7 +52,8 @@ type options struct {
 func newFlags(name string) (*flag.FlagSet, options) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	o := options{
-		source:   fs.String("source", "", "caminho do gamepad; vazio = autodetectar"),
+		source:   fs.String("source", "", "caminhos dos gamepads separados por vírgula; vazio = autodetectar"),
+		maxPads:  fs.Int("max-pads", 2, "número máximo de pads virtuais"),
 		deadzone: fs.Float64("deadzone", 0.08, "deadzone radial dos sticks"),
 		name:     fs.String("name", defaultName, "nome do controle virtual"),
 		vendor:   fs.Uint("vendor", defaultVendor, "vendor ID virtual"),
@@ -182,6 +186,27 @@ func listenCmd(args []string) {
 	}
 }
 
+// channel liga um gamepad físico ao seu próprio pad Xbox 360 virtual.
+type channel struct {
+	path  string
+	src   *evdev.Device
+	pad   *uinput.Device
+	state *mapper.State
+}
+
+func parseSources(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func runCmd(args []string) {
 	fs, o := newFlags("run")
 	_ = fs.Parse(args)
@@ -191,18 +216,92 @@ func runCmd(args []string) {
 	product := uint16(*o.product)
 	deadzone := *o.deadzone
 	verbose := *o.verbose
-	sourcePath := *o.source
-
-	pad, err := uinput.Create(name, vendor, product)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "erro:", err)
-		os.Exit(1)
+	explicit := parseSources(*o.source)
+	maxPads := *o.maxPads
+	if maxPads < 1 {
+		maxPads = 1
 	}
-	defer pad.Close()
-	fmt.Printf("Controle virtual criado: %q (%04x:%04x)\n", name, vendor, product)
 
 	done, stop := doneChannel()
 	defer stop()
+
+	channels := make(map[string]*channel)
+
+	removeChannel := func(ch *channel) {
+		delete(channels, ch.path)
+		_ = ch.src.Close()
+		_ = ch.pad.Close()
+		fmt.Printf("Pad removido: %s\n", ch.path)
+	}
+	defer func() {
+		for _, ch := range channels {
+			removeChannel(ch)
+		}
+	}()
+
+	addChannel := func(path string) {
+		if len(channels) >= maxPads {
+			return
+		}
+		if _, exists := channels[path]; exists {
+			return
+		}
+		src, err := evdev.Open(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "aviso: não foi possível abrir", path+":", err)
+			return
+		}
+		pad, err := uinput.Create(name, vendor, product)
+		if err != nil {
+			_ = src.Close()
+			fmt.Fprintln(os.Stderr, "erro ao criar pad virtual:", err)
+			return
+		}
+		state := mapper.New(src, deadzone)
+		keys, axes := state.Snapshot()
+		if err := pad.Send(keys, axes); err != nil {
+			_ = src.Close()
+			_ = pad.Close()
+			fmt.Fprintln(os.Stderr, "erro ao publicar estado inicial:", err)
+			return
+		}
+		channels[path] = &channel{path: path, src: src, pad: pad, state: state}
+		fmt.Printf("Pad %d conectado: %s (%s) -> Xbox 360 #%d\n",
+			len(channels), path, stringsTrim(src.Name), len(channels))
+	}
+
+	syncChannels := func() {
+		targets := explicit
+		if len(targets) == 0 {
+			pads, err := evdev.Detect()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "erro ao detectar gamepads:", err)
+				return
+			}
+			for _, p := range pads {
+				targets = append(targets, p.Path)
+			}
+		}
+		want := make(map[string]bool, len(targets))
+		for _, p := range targets {
+			want[p] = true
+		}
+		for path, ch := range channels {
+			if !want[path] {
+				removeChannel(ch)
+			}
+		}
+		for _, p := range targets {
+			if _, err := evdev.Inspect(p); err != nil {
+				continue // ainda não conectado
+			}
+			addChannel(p)
+		}
+	}
+
+	syncChannels()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -210,58 +309,55 @@ func runCmd(args []string) {
 			return
 		default:
 		}
+		select {
+		case <-ticker.C:
+			syncChannels()
+		default:
+		}
 
-		src, err := openSource(sourcePath)
+		sources := make([]*evdev.Device, 0, len(channels))
+		for _, ch := range channels {
+			sources = append(sources, ch.src)
+		}
+		ready, err := evdev.Select(sources, 200*time.Millisecond)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "aviso:", err, "-- tentando novamente em 2s")
-			select {
-			case <-done:
-				return
-			case <-time.After(2 * time.Second):
-			}
+			fmt.Fprintln(os.Stderr, "erro no select:", err)
 			continue
 		}
-		fmt.Printf("Conectado em %s (%s). Pressione Ctrl+C para parar.\n",
-			src.Path, stringsTrim(src.Name))
-
-		state := mapper.New(src, deadzone)
-		keys, axes := state.Snapshot()
-		if err := pad.Send(keys, axes); err != nil {
-			fmt.Fprintln(os.Stderr, "erro ao publicar estado inicial:", err)
-			src.Close()
-			return
-		}
-
-		connected := true
-		for connected {
-			select {
-			case <-done:
-				src.Close()
-				return
-			default:
-			}
-			ev, err := src.ReadTimeout(250 * time.Millisecond)
-			if errors.Is(err, evdev.ErrTimeout) {
-				continue
-			}
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "gamepad desconectado:", err)
-				_ = src.Close()
-				connected = false
-				break
-			}
-			if ev.Type == evdev.EV_SYN {
-				keys, axes := state.Snapshot()
-				if err := pad.Send(keys, axes); err != nil {
-					fmt.Fprintln(os.Stderr, "erro ao enviar eventos:", err)
-					_ = src.Close()
-					return
+		for _, src := range ready {
+			var target *channel
+			for _, ch := range channels {
+				if ch.src == src {
+					target = ch
+					break
 				}
+			}
+			if target == nil {
 				continue
 			}
-			state.Apply(ev)
-			if verbose {
-				fmt.Println("→", ev.String())
+			for {
+				ev, err := target.src.Read()
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+					break
+				}
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "gamepad desconectado:", target.path, err)
+					removeChannel(target)
+					break
+				}
+				if ev.Type == evdev.EV_SYN {
+					keys, axes := target.state.Snapshot()
+					if err := target.pad.Send(keys, axes); err != nil {
+						fmt.Fprintln(os.Stderr, "erro ao enviar eventos:", err)
+						removeChannel(target)
+						break
+					}
+					continue
+				}
+				target.state.Apply(ev)
+				if verbose {
+					fmt.Printf("[%s] → %s\n", target.path, ev.String())
+				}
 			}
 		}
 	}

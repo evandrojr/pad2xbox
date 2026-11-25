@@ -47,11 +47,22 @@ sudo rm -f /etc/systemd/system/pad2xbox.service \
 ```bash
 go run . detect                          # lista gamepads e suas capacidades
 go run . listen                          # mostra eventos brutos (aperte botões)
-go run . run                             # inicia o emulador
-go run . run -source /dev/input/event30 -deadzone 0.12 -verbose
+go run . run                             # inicia o emulador (até 2 pads)
+go run . run -max-pads 4                 # permite até 4 pads
+go run . run -source /dev/input/event30,/dev/input/event34
+go run . run -deadzone 0.12 -verbose
 ```
 
-`Ctrl+C` encerra e remove o dispositivo virtual.
+`Ctrl+C` encerra e remove os dispositivos virtuais.
+
+### Dois ou mais controles
+
+Por padrão o `run` aceita **até 2 gamepads**, criando um pad Xbox 360 virtual
+independente para cada um (J1/J2). A detecção é automática e inclui hot-plug:
+conectar ou desconectar um controle atualiza os pads virtuais em tempo real.
+Use `-max-pads N` para permitir mais, ou `-source caminho1,caminho2` para fixar
+quais dispositivos usar. Dispositivos uinput virtuais são ignorados na detecção
+para não gerar loop com o próprio emulador.
 
 ## Mapeamento
 

@@ -59,6 +59,8 @@ EOF
 udevadm control --reload
 systemctl daemon-reload
 systemctl enable --now pad2xbox.service
+# enable --now não reinicia um serviço já ativo; força o carregamento do binário novo.
+systemctl restart pad2xbox.service
 
 echo
 systemctl --no-pager status pad2xbox.service || true
