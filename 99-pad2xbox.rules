@@ -1,0 +1,7 @@
+# Copiar para /etc/udev/rules.d/ e reconectar o controle.
+# Permite que o usuário logado use /dev/uinput sem root.
+KERNEL=="uinput", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
+# O driver hid-dragonrise já costuma marcar o evento com uaccess.
+# Se necessário, descomente ajustando o número do evento:
+# SUBSYSTEM=="input", KERNEL=="event[0-9]*", ATTRS{id/vendor}=="0079", ATTRS{id/product}=="0006", TAG+="uaccess"

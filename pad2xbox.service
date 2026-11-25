@@ -1,0 +1,18 @@
+[Unit]
+Description=pad2xbox: generic USB gamepad -> Xbox 360 virtual controller
+Documentation=https://github.com/evandrojr/pad2xbox
+After=local-fs.target
+
+[Service]
+Type=simple
+User=j
+Group=j
+WorkingDirectory=/home/j/lab/pad2xbox
+ExecStart=/usr/local/bin/pad2xbox run
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
